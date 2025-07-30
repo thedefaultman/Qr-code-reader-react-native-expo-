@@ -1,0 +1,143 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-expo-android:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+
+    - name: Setup Expo CLI
+      run: npm install -g @expo/cli eas-cli
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Setup EAS
+      uses: expo/expo-github-action@v8
+      with:
+        eas-version: latest
+        token: ${{ secrets.EXPO_TOKEN }}
+
+    - name: Build Android APK
+      run: |
+        # Create eas.json if it doesn't exist
+        if [ ! -f eas.json ]; then
+          cat > eas.json << 'EOF'
+        {
+          "cli": {
+            "version": ">= 3.0.0",
+            "appVersionSource": "remote"
+          },
+          "build": {
+            "development": {
+              "developmentClient": true,
+              "distribution": "internal"
+            },
+            "preview": {
+              "distribution": "internal",
+              "android": {
+                "buildType": "apk"
+              }
+            },
+            "production": {
+              "android": {
+                "buildType": "apk",
+                "gradleCommand": ":app:assembleRelease"
+              }
+            }
+          }
+        }
+        EOF
+        fi
+        
+        # Start build without waiting (builds run on Expo servers)
+        echo "Starting Expo build..."
+        BUILD_ID=$(eas build --platform android --profile production --non-interactive --json | jq -r '.id')
+        echo "Build started with ID: $BUILD_ID"
+        echo "BUILD_ID=$BUILD_ID" >> $GITHUB_ENV
+        
+        # Wait for build completion with timeout
+        echo "Waiting for build to complete..."
+        for i in {1..60}; do
+          STATUS=$(eas build:view $BUILD_ID --json | jq -r '.status')
+          echo "Build status: $STATUS (check $i/60)"
+          
+          if [ "$STATUS" = "finished" ]; then
+            echo "Build completed successfully!"
+            break
+          elif [ "$STATUS" = "errored" ] || [ "$STATUS" = "canceled" ]; then
+            echo "Build failed with status: $STATUS"
+            exit 1
+          fi
+          
+          sleep 60  # Wait 1 minute between checks
+        done
+        
+        if [ "$STATUS" != "finished" ]; then
+          echo "Build timed out after 60 minutes"
+          exit 1
+        fi
+
+    - name: Download and upload artifacts
+      run: |
+        # Get the build artifact URL
+        BUILD_URL=$(eas build:view $BUILD_ID --json | jq -r '.artifacts.buildUrl // empty')
+        if [ -n "$BUILD_URL" ] && [ "$BUILD_URL" != "null" ]; then
+          echo "Downloading APK from: $BUILD_URL"
+          curl -L -o android-build.apk "$BUILD_URL"
+          echo "APK downloaded successfully"
+        else
+          echo "No build URL found for build ID: $BUILD_ID"
+          exit 1
+        fi
+
+    - name: Upload Android build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: expo-android-build
+        path: android-build.apk
+        retention-days: 30
+      if: success()
+
+
+    - name: Upload artifacts to S3
+      if: always()
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: us-east-2
+      run: |
+        # Upload Expo builds and record usage
+        if [ -f android-build.apk ]; then
+          FILE_SIZE=$(stat -c%s android-build.apk)
+          aws s3 cp android-build.apk s3://mobile-latch/artifacts/${{ github.run_id }}/android-build.apk
+          curl -X POST "https://latchkey.dev/api/storage-usage/record-from-workflow" \
+            -H "Content-Type: application/json" \
+            -H "x-github-run-id: ${{ github.run_id }}" \
+            -H "x-github-repo: ${{ github.repository }}" \
+            -d "{\"provider\": \"s3\", \"bucket\": \"mobile-latch\", \"path\": \"artifacts/${{ github.run_id }}/android-build.apk\", \"size\": $FILE_SIZE, \"artifactType\": \"apk\"}"
+        fi
+        if [ -f ios-build.tar.gz ]; then
+          FILE_SIZE=$(stat -c%s ios-build.tar.gz)
+          aws s3 cp ios-build.tar.gz s3://mobile-latch/artifacts/${{ github.run_id }}/ios-build.tar.gz
+          curl -X POST "https://latchkey.dev/api/storage-usage/record-from-workflow" \
+            -H "Content-Type: application/json" \
+            -H "x-github-run-id: ${{ github.run_id }}" \
+            -H "x-github-repo: ${{ github.repository }}" \
+            -d "{\"provider\": \"s3\", \"bucket\": \"mobile-latch\", \"path\": \"artifacts/${{ github.run_id }}/ios-build.tar.gz\", \"size\": $FILE_SIZE, \"artifactType\": \"ipa\"}"
+        fi
+        echo "Artifacts uploaded to s3://mobile-latch/artifacts/${{ github.run_id }}/"
